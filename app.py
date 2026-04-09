@@ -2,9 +2,8 @@ import sys
 import os
 import logging
 import json
-import requests
 import random
-import garth  # Ensure 'garth' is in your requirements.txt
+import garth
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,7 +16,6 @@ logger = logging.getLogger("runward-bridge")
 # 1. Path Setup
 sys.path.insert(0, os.path.join(os.getcwd(), "src"))
 
-# 2. Imports
 try:
     from garmy import AuthClient
 except ImportError:
@@ -40,17 +38,31 @@ class LoginRequest(BaseModel):
     password: Optional[str] = None
     token: Optional[str] = None
 
-def get_random_proxy():
+# --- PROXY LOGIC FOR YOUR WEBSHARE LIST ---
+def get_webshare_proxy():
+    """Reads your uploaded proxy list and formats a random one for garth."""
     try:
-        # Fetch fresh proxies from Proxifly
-        url = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt"
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            proxies = [p.strip() for p in response.text.split('\n') if p.strip()]
-            if proxies:
-                return random.choice(proxies)
+        # Assuming the file is in your root directory
+        file_path = "Webshare 10 proxies.txt"
+        if not os.path.exists(file_path):
+            logger.warning(f"{file_path} not found. Using direct connection.")
+            return None
+            
+        with open(file_path, "r") as f:
+            proxies = [line.strip() for line in f if line.strip()]
+            
+        if not proxies:
+            return None
+            
+        # Select a random proxy from your list
+        chosen = random.choice(proxies)
+        # Format: IP:PORT:USER:PASS
+        parts = chosen.split(':')
+        if len(parts) == 4:
+            ip, port, user, pw = parts
+            return f"http://{user}:{pw}@{ip}:{port}"
     except Exception as e:
-        logger.error(f"Failed to fetch proxy list: {e}")
+        logger.error(f"Error reading proxy list: {e}")
     return None
 
 @app.get("/")
@@ -61,64 +73,49 @@ def health():
 async def authenticate(data: LoginRequest):
     logger.info(f"Auth request for: {data.email}")
     
+    # Select and apply a proxy from your file
+    proxy_url = get_webshare_proxy()
+    if proxy_url:
+        garth.client.proxies = {"http": proxy_url, "https": proxy_url}
+        logger.info("Proxy applied from Webshare list.")
+    
     try:
-        # 1. ATTEMPT RESUME (No Proxy needed for tokens usually)
+        auth_client = AuthClient()
+
+        # 1. Attempt Resume
         if data.token:
             try:
-                auth_client = AuthClient()
                 auth_client.garth.loads(data.token)
                 return {
                     "success": True, 
                     "display_name": getattr(auth_client, 'display_name', 'User'), 
                     "session_data": data.token
                 }
-            except Exception as resume_err:
-                logger.warning(f"Token resume failed: {resume_err}")
-
-        # 2. FRESH LOGIN WITH PROXY ROTATION
-        last_error = "Unknown Error"
-        for attempt in range(3):
-            proxy_addr = get_random_proxy()
-            if proxy_addr:
-                logger.info(f"Attempt {attempt+1}: Using proxy {proxy_addr}")
-                # Set garth proxies globally
-                garth.client.proxies = {
-                    "http": f"http://{proxy_addr}",
-                    "https": f"http://{proxy_addr}"
-                }
-            
-            try:
-                auth_client = AuthClient()
-                auth_client.login(data.email, data.password)
-                
-                # Success!
-                session_string = auth_client.garth.dumps()
-                return {
-                    "success": True,
-                    "display_name": getattr(auth_client, 'display_name', data.email.split('@')[0]),
-                    "session_data": session_string
-                }
             except Exception as e:
-                last_error = str(e)
-                logger.warning(f"Login attempt {attempt+1} failed: {last_error}")
-                if "429" not in last_error: # If it's a wrong password, don't bother retrying with proxies
-                    break
+                logger.warning(f"Token resume failed: {e}")
+
+        # 2. Fresh Login
+        if not data.password:
+            raise ValueError("Password is required for fresh login.")
+            
+        logger.info(f"Performing Garmin login for {data.email}")
+        auth_client.login(data.email, data.password)
         
-        # If we exhausted retries or hit a non-retryable error
-        raise Exception(last_error)
+        # Success!
+        session_string = auth_client.garth.dumps()
+        return {
+            "success": True,
+            "display_name": getattr(auth_client, 'display_name', data.email.split('@')[0]),
+            "session_data": session_string
+        }
 
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"Final Auth Error: {error_msg}")
+        logger.error(f"Auth Error: {error_msg}")
         
-        status = 400
-        if "429" in error_msg:
-            detail = "Garmin is blocking these requests. Wait 15 mins or try again."
-            status = 429
-        else:
-            detail = f"Garmin login failed: {error_msg}"
-            
-        raise HTTPException(status_code=status, detail=detail)
+        status_code = 429 if "429" in error_msg else 400
+        # If it's a 429, the next attempt will automatically pick a different IP from your list
+        raise HTTPException(status_code=status_code, detail=error_msg)
 
 if __name__ == "__main__":
     import uvicorn
