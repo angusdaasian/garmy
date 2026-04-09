@@ -2,7 +2,9 @@ import sys
 import os
 import logging
 import json
-from fastapi import FastAPI, HTTPException, Request
+import requests
+import random
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -29,11 +31,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 3. Model allows for either Password OR a stored Token
 class LoginRequest(BaseModel):
     email: str
     password: Optional[str] = None
-    token: Optional[str] = None  # Supabase can send the stored session here
+    token: Optional[str] = None
+
+# HELPER: Get a random proxy from Proxifly
+def get_random_proxy():
+    try:
+        # Fetching the latest HTTP proxy list from Proxifly CDN
+        url = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt"
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            proxies = response.text.strip().split('\n')
+            return random.choice(proxies)
+    except Exception as e:
+        logger.error(f"Failed to fetch proxy list: {e}")
+    return None
 
 @app.get("/")
 def health():
@@ -42,39 +56,45 @@ def health():
 @app.post("/auth")
 async def authenticate(data: LoginRequest):
     logger.info(f"Auth request for: {data.email}")
+    
     try:
         auth_client = AuthClient()
-        
-        # --- PHASE 1: ATTEMPT TO RESUME EXISTING SESSION ---
+
+        # 1. Attempt to resume if token exists
         if data.token:
-            logger.info(f"Attempting to resume session for {data.email}")
             try:
-                # Load the JSON string back into the garth client
                 auth_client.garth.loads(data.token)
-                # Quick check to see if token is still valid
-                display_name = getattr(auth_client, 'display_name', 'User')
-                return {
-                    "success": True,
-                    "display_name": display_name,
-                    "session_data": data.token # Return the same token back
-                }
-            except Exception as resume_err:
-                logger.warning(f"Session resume failed for {data.email}, falling back to login")
+                return {"success": True, "display_name": getattr(auth_client, 'display_name', 'User'), "session_data": data.token}
+            except:
+                logger.warning("Token resume failed, falling back to login")
 
-        # --- PHASE 2: FRESH LOGIN (Only if resume fails or no token) ---
-        if not data.password:
-             raise HTTPException(status_code=400, detail="Password required for new login")
-             
-        logger.info(f"Performing fresh Garmin SSO login for {data.email}")
-        auth_client.login(data.email, data.password)
+        # 2. Fresh Login with Proxy
+        proxy_addr = get_random_proxy()
+        proxy_config = None
         
-        # Extract session data as a string for Supabase storage
-        session_string = ""
-        if hasattr(auth_client, 'garth'):
-            session_string = auth_client.garth.dumps()
-        elif hasattr(auth_client, 'session_data'):
-            session_string = json.dumps(auth_client.session_data)
+        if proxy_addr:
+            logger.info(f"Using proxy: {proxy_addr}")
+            proxy_config = {
+                "http": f"http://{proxy_addr}",
+                "https": f"http://{proxy_addr}"
+            }
 
+        # Passing proxies to the login method (supported by garth/requests)
+        # We wrap this in a retry because free proxies often fail
+        for attempt in range(3):
+            try:
+                auth_client.login(data.email, data.password, proxies=proxy_config)
+                break 
+            except Exception as e:
+                if attempt == 2: raise e
+                logger.warning(f"Login attempt {attempt+1} failed with proxy, trying another...")
+                proxy_addr = get_random_proxy()
+                if proxy_addr:
+                    proxy_config = {"http": f"http://{proxy_addr}", "https": f"http://{proxy_addr}"}
+
+        # 3. Success Logic
+        session_string = auth_client.garth.dumps() if hasattr(auth_client, 'garth') else ""
+        
         return {
             "success": True,
             "display_name": getattr(auth_client, 'display_name', data.email.split('@')[0]),
@@ -83,19 +103,8 @@ async def authenticate(data: LoginRequest):
 
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"Garmin Auth Error: {error_msg}")
-        
-        if "429" in error_msg:
-            detail = "Garmin is temporarily rate-limiting requests. Please try again in an hour."
-            status = 429
-        elif "MFA" in error_msg.upper():
-            detail = "Garmin MFA required. Please check your email."
-            status = 400
-        else:
-            detail = f"Garmin login failed: {error_msg}"
-            status = 400
-            
-        raise HTTPException(status_code=status, detail=detail)
+        logger.error(f"Final Auth Error: {error_msg}")
+        raise HTTPException(status_code=400, detail=f"Garmin login failed. {error_msg}")
 
 if __name__ == "__main__":
     import uvicorn
