@@ -4,14 +4,20 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# This ensures Python can find the Garmy code inside the /src folder
+# 1. This line is CRITICAL. It tells Python to look inside the 'src' folder
+# for the 'garmy' package.
 sys.path.append(os.path.join(os.getcwd(), "src"))
 
-from garmy.auth.session import GarminSession # Adjust based on forked structure
+# 2. Update this import line to match the folder structure
+try:
+    from garmy.auth.session import GarminSession
+except ImportError:
+    # Fallback in case the structure is different in your specific fork
+    from src.garmy.auth.session import GarminSession
 
 app = FastAPI()
 
-# Fixes the CORS issues we saw earlier with Lovable/React
+# Standard CORS settings so your React app can talk to this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,8 +36,8 @@ def health_check():
 @app.post("/auth")
 async def authenticate(data: LoginRequest):
     try:
-        # Using the Garmy session logic to exchange credentials for tokens
         session = GarminSession(email=data.email, password=data.password)
+        # Garmy's login method usually returns the session/tokens
         tokens = session.login() 
         return tokens
     except Exception as e:
