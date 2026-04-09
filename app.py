@@ -1,18 +1,20 @@
 import sys
 import os
 import logging
+import json
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 
-# Setup basic logging to see Garmin errors in Railway console
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("runward-bridge")
 
-# 1. Force the 'src' directory into the search path
+# 1. Path Setup
 sys.path.insert(0, os.path.join(os.getcwd(), "src"))
 
-# 2. Modern Garmy Import
+# 2. Imports
 try:
     from garmy import AuthClient
 except ImportError:
@@ -27,9 +29,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 3. Model allows for either Password OR a stored Token
 class LoginRequest(BaseModel):
     email: str
-    password: str
+    password: Optional[str] = None
+    token: Optional[str] = None  # Supabase can send the stored session here
 
 @app.get("/")
 def health():
@@ -37,49 +41,62 @@ def health():
 
 @app.post("/auth")
 async def authenticate(data: LoginRequest):
-    logger.info(f"Received auth request for: {data.email}")
+    logger.info(f"Auth request for: {data.email}")
     try:
         auth_client = AuthClient()
         
-        # This performs the login. 
-        # If this fails, it usually raises a GarthHTTPError or similar.
+        # --- PHASE 1: ATTEMPT TO RESUME EXISTING SESSION ---
+        if data.token:
+            logger.info(f"Attempting to resume session for {data.email}")
+            try:
+                # Load the JSON string back into the garth client
+                auth_client.garth.loads(data.token)
+                # Quick check to see if token is still valid
+                display_name = getattr(auth_client, 'display_name', 'User')
+                return {
+                    "success": True,
+                    "display_name": display_name,
+                    "session_data": data.token # Return the same token back
+                }
+            except Exception as resume_err:
+                logger.warning(f"Session resume failed for {data.email}, falling back to login")
+
+        # --- PHASE 2: FRESH LOGIN (Only if resume fails or no token) ---
+        if not data.password:
+             raise HTTPException(status_code=400, detail="Password required for new login")
+             
+        logger.info(f"Performing fresh Garmin SSO login for {data.email}")
         auth_client.login(data.email, data.password)
         
-        # Extract display name safely
-        display_name = getattr(auth_client, 'display_name', data.email.split('@')[0])
-        
-        # Get session data. Note: 'garmy' usually stores tokens in auth_client.garth
-        # We need to ensure we're returning a dictionary for Supabase to JSONify.
-        session_data = {}
-        if hasattr(auth_client, 'session_data'):
-            session_data = auth_client.session_data
-        elif hasattr(auth_client, 'garth'):
-            # Fallback if garmy is using raw garth sessions
-            session_data = auth_client.garth.dumps()
-
-        logger.info(f"Login successful for {data.email}")
+        # Extract session data as a string for Supabase storage
+        session_string = ""
+        if hasattr(auth_client, 'garth'):
+            session_string = auth_client.garth.dumps()
+        elif hasattr(auth_client, 'session_data'):
+            session_string = json.dumps(auth_client.session_data)
 
         return {
             "success": True,
-            "display_name": display_name,
-            "session_data": session_data
+            "display_name": getattr(auth_client, 'display_name', data.email.split('@')[0]),
+            "session_data": session_string
         }
 
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"Garmin Auth Error for {data.email}: {error_msg}")
+        logger.error(f"Garmin Auth Error: {error_msg}")
         
-        # Check for common Garmin triggers
-        if "MFA" in error_msg.upper():
-            detail = "Garmin requires Multi-Factor Authentication. Please login on a browser first."
-        elif "401" in error_msg or "403" in error_msg:
-            detail = "Invalid Garmin credentials or account locked."
+        if "429" in error_msg:
+            detail = "Garmin is temporarily rate-limiting requests. Please try again in an hour."
+            status = 429
+        elif "MFA" in error_msg.upper():
+            detail = "Garmin MFA required. Please check your email."
+            status = 400
         else:
             detail = f"Garmin login failed: {error_msg}"
+            status = 400
             
-        raise HTTPException(status_code=400, detail=detail)
+        raise HTTPException(status_code=status, detail=detail)
 
-# For local testing
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
