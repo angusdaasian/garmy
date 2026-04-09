@@ -4,6 +4,7 @@ import logging
 import json
 import requests
 import random
+import garth  # Import garth directly to set proxies
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -13,10 +14,8 @@ from typing import Optional
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("runward-bridge")
 
-# 1. Path Setup
 sys.path.insert(0, os.path.join(os.getcwd(), "src"))
 
-# 2. Imports
 try:
     from garmy import AuthClient
 except ImportError:
@@ -36,10 +35,8 @@ class LoginRequest(BaseModel):
     password: Optional[str] = None
     token: Optional[str] = None
 
-# HELPER: Get a random proxy from Proxifly
 def get_random_proxy():
     try:
-        # Fetching the latest HTTP proxy list from Proxifly CDN
         url = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt"
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
@@ -58,53 +55,58 @@ async def authenticate(data: LoginRequest):
     logger.info(f"Auth request for: {data.email}")
     
     try:
-        auth_client = AuthClient()
-
-        # 1. Attempt to resume if token exists
+        # 1. Attempt Resume
         if data.token:
             try:
+                auth_client = AuthClient()
                 auth_client.garth.loads(data.token)
-                return {"success": True, "display_name": getattr(auth_client, 'display_name', 'User'), "session_data": data.token}
+                return {
+                    "success": True, 
+                    "display_name": getattr(auth_client, 'display_name', 'User'), 
+                    "session_data": data.token
+                }
             except:
-                logger.warning("Token resume failed, falling back to login")
+                logger.warning("Token resume failed")
 
-        # 2. Fresh Login with Proxy
-        proxy_addr = get_random_proxy()
-        proxy_config = None
-        
-        if proxy_addr:
-            logger.info(f"Using proxy: {proxy_addr}")
-            proxy_config = {
-                "http": f"http://{proxy_addr}",
-                "https": f"http://{proxy_addr}"
-            }
-
-        # Passing proxies to the login method (supported by garth/requests)
-        # We wrap this in a retry because free proxies often fail
+        # 2. Fresh Login with Proxy Rotation
+        # We try 3 different proxies if they fail
         for attempt in range(3):
+            proxy_addr = get_random_proxy()
+            if proxy_addr:
+                logger.info(f"Attempt {attempt+1}: Using proxy {proxy_addr}")
+                # This is the correct way: Set it globally for garth
+                garth.client.proxies = {
+                    "http": f"http://{proxy_addr}",
+                    "https": f"http://{proxy_addr}"
+                }
+            
             try:
-                auth_client.login(data.email, data.password, proxies=proxy_config)
-                break 
+                auth_client = AuthClient()
+                auth_client.login(data.email, data.password)
+                
+                # If we get here, login worked!
+                session_string = auth_client.garth.dumps()
+                return {
+                    "success": True,
+                    "display_name": getattr(auth_client, 'display_name', data.email.split('@')[0]),
+                    "session_data": session_string
+                }
             except Exception as e:
-                if attempt == 2: raise e
-                logger.warning(f"Login attempt {attempt+1} failed with proxy, trying another...")
-                proxy_addr = get_random_proxy()
-                if proxy_addr:
-                    proxy_config = {"http": f"http://{proxy_addr}", "https": f"http://{proxy_addr}"}
-
-        # 3. Success Logic
-        session_string = auth_client.garth.dumps() if hasattr(auth_client, 'garth') else ""
-        
-        return {
-            "success": True,
-            "display_name": getattr(auth_client, 'display_name', data.email.split('@')[0]),
-            "session_data": session_string
-        }
+                logger.warning(f"Login attempt {attempt+1} failed: {str(e)}")
+                if attempt == 2:
+                    raise e # Re-raise the last error if all attempts fail
 
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Final Auth Error: {error_msg}")
-        raise HTTPException(status_code=400, detail=f"Garmin login failed. {error_msg}")
+        
+        # Friendly error handling for the 429 block
+        if "429" in error_msg:
+            detail = "Garmin is rate-limiting this request. Please try again in a few minutes."
+        else:
+            detail = f"Garmin login failed: {error_msg}"
+            
+        raise HTTPException(status_code=400, detail=detail)
 
 if __name__ == "__main__":
     import uvicorn
